@@ -1,0 +1,26 @@
+# Database
+backend/gateway.db
+
+# User uploaded project files
+projects/
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+backend/__pycache__/
+
+# Environment variables
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
