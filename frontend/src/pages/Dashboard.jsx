@@ -130,7 +130,9 @@ export default function Dashboard({ active }) {
     return () => { clearInterval(timerRef.current); abortRef.current?.abort() }
   }, [active])
 
-  const ollanaOk = health?.ollama === 'ok'
+  const ollamaOk = health?.ollama === 'ok'
+  const healthLoaded = health !== null
+  const aiOffline = healthLoaded && !ollamaOk
   const hasActiveModel = nodeStats?.active_model
 
   return (
@@ -143,13 +145,51 @@ export default function Dashboard({ active }) {
           Overview
         </h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span className={`apple-pill ${ollanaOk ? 'apple-pill-green' : 'apple-pill-neutral'}`}>
-            <span className={`apple-dot ${ollanaOk ? 'apple-dot-green apple-dot-pulse' : 'apple-dot-gray'}`} />
-            {health === null ? 'Connecting...' : ollanaOk ? 'All Systems Online' : 'Node Unreachable'}
+          <span className={`apple-pill ${ollamaOk ? 'apple-pill-green' : 'apple-pill-neutral'}`}>
+            <span className={`apple-dot ${ollamaOk ? 'apple-dot-green apple-dot-pulse' : 'apple-dot-gray'}`} />
+            {!healthLoaded ? 'Connecting...' : ollamaOk ? 'All Systems Online' : 'AI Node Offline'}
           </span>
-          <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>10.0.0.24 → 10.0.0.8</span>
+          <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>10.0.0.24 to 10.0.0.8</span>
         </div>
       </div>
+
+      {aiOffline && (
+        <div style={{
+          background: 'rgba(255,149,0,0.10)',
+          border: '1px solid rgba(255,149,0,0.28)',
+          borderRadius: 'var(--radius)',
+          padding: '18px 22px',
+          marginBottom: 32,
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 14,
+        }}>
+          <div style={{
+            width: 10,
+            height: 10,
+            borderRadius: '50%',
+            background: 'var(--orange)',
+            flexShrink: 0,
+            marginTop: 6,
+            boxShadow: '0 0 0 4px rgba(255,149,0,0.12)',
+          }} />
+          <div style={{ flex: 1 }}>
+            <div style={{
+              fontSize: 15,
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+              letterSpacing: '-0.02em',
+              marginBottom: 4,
+            }}>
+              Gateway is online, but austin-ai is not reachable.
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+              Check that the AI laptop has power, is awake, is on the wired LAN, and that Ollama is running on port 11434.
+              Model lists and new AI requests will be unavailable until the node reconnects.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Active model banner */}
       {hasActiveModel && (
@@ -193,14 +233,14 @@ export default function Dashboard({ active }) {
         <StatCard label="Gateway" value="Online" sub="port 8000" accent />
         <StatCard
           label="AI Node"
-          value={nodeStats ? 'Online' : '—'}
-          sub="austin-ai · 10.0.0.8"
-          accent={!!nodeStats}
+          value={!healthLoaded ? '-' : ollamaOk ? 'Online' : 'Offline'}
+          sub={ollamaOk ? 'austin-ai - 10.0.0.8' : 'No connection to Ollama'}
+          accent={ollamaOk}
         />
         <StatCard
           label="Models Available"
-          value={models.length || '—'}
-          sub={models.length ? `${models.map(m => (m.size/1e9).toFixed(0)).reduce((a,b)=>+a+ +b,0)} GB total` : 'Loading'}
+          value={models.length || '-'}
+          sub={models.length ? `${models.map(m => (m.size/1e9).toFixed(0)).reduce((a,b)=>+a+ +b,0)} GB total` : aiOffline ? 'AI node offline' : 'Loading'}
         />
       </div>
 
@@ -214,7 +254,9 @@ export default function Dashboard({ active }) {
             <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{models.length} loaded</span>
           </div>
           {models.length === 0 ? (
-            <div style={{ color: 'var(--text-tertiary)', fontSize: 14 }}>Loading...</div>
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 14 }}>
+              {aiOffline ? 'Models unavailable while the AI node is offline.' : 'Loading...'}
+            </div>
           ) : models.map(m => (
             <div key={m.name} style={{
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -342,12 +384,12 @@ export default function Dashboard({ active }) {
             <TopologyNode label="Home Gateway" sub="10.0.0.24" active />
           </div>
 
-          <ConnectorLine active={!!topology.active_model} />
+          <ConnectorLine active={ollamaOk && !!topology.active_model} />
 
           {/* AI Node */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 160 }}>
             <div className="apple-label" style={{ marginBottom: 4 }}>AI Node</div>
-            <TopologyNode label="austin-ai" sub="10.0.0.8 · Ollama" active={!!topology.active_model} />
+            <TopologyNode label="austin-ai" sub={ollamaOk ? '10.0.0.8 - Ollama' : 'Offline'} active={ollamaOk} />
             {topology.active_model && (
               <TopologyNode label={topology.active_model} sub="Active model" active />
             )}
