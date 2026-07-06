@@ -26,6 +26,28 @@ function pct(value, total) {
   return Math.min(100, Math.round(value / total * 100))
 }
 
+function mergeTopologyConnections(completedConnections, activeRequests) {
+  const byKey = new Map()
+  for (const conn of completedConnections || []) {
+    const key = `${conn.app_name}:${conn.model}`
+    byKey.set(key, { ...conn, state: 'recent' })
+  }
+  for (const req of activeRequests || []) {
+    const key = `${req.app_name}:${req.model}`
+    byKey.set(key, {
+      app_name: req.app_name,
+      model: req.model,
+      last_seen: req.started_at,
+      elapsed_ms: req.elapsed_ms,
+      state: 'in-flight',
+    })
+  }
+  return [...byKey.values()].sort((a, b) => {
+    if (a.state !== b.state) return a.state === 'in-flight' ? -1 : 1
+    return String(b.last_seen || '').localeCompare(String(a.last_seen || ''))
+  })
+}
+
 function StatCard({ label, value, sub, accent }) {
   return (
     <div className="apple-card" style={{ padding: '20px 24px' }}>
@@ -156,6 +178,7 @@ export default function Dashboard({ active }) {
   const queueLimit = queue.queue_limit ?? 0
   const loadPercent = pct(activeCount, concurrencyLimit)
   const waitPercent = pct(waitingCount, queueLimit)
+  const topologyConnections = mergeTopologyConnections(topology.connections, activeRequests)
   const gatewayMode = aiOffline
     ? 'Node offline'
     : waitingCount > 0
@@ -513,19 +536,24 @@ export default function Dashboard({ active }) {
           {/* Apps */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 150 }}>
             <div className="apple-label" style={{ marginBottom: 4 }}>Apps</div>
-            {topology.connections.length === 0 ? (
+            {topologyConnections.length === 0 ? (
               <div style={{
                 background: 'var(--bg-subtle)', borderRadius: 12,
                 padding: '12px 16px', fontSize: 13, color: 'var(--text-tertiary)', fontStyle: 'italic',
               }}>
                 No active apps
               </div>
-            ) : topology.connections.map((c, i) => (
-              <TopologyNode key={i} label={c.app_name} sub={c.model} active />
+            ) : topologyConnections.map((c, i) => (
+              <TopologyNode
+                key={`${c.app_name}-${c.model}-${i}`}
+                label={c.app_name}
+                sub={c.state === 'in-flight' ? `${c.model} - ${fmtMs(c.elapsed_ms)}` : c.model}
+                active={c.state === 'in-flight'}
+              />
             ))}
           </div>
 
-          <ConnectorLine active={topology.connections.length > 0} />
+          <ConnectorLine active={topologyConnections.length > 0} />
 
           {/* Gateway */}
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
