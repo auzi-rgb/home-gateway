@@ -6,6 +6,8 @@ import sqlite3
 import os
 import shutil
 import asyncio
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -17,6 +19,7 @@ OLLAMA_MAX_QUEUE   = int(os.getenv("OLLAMA_MAX_QUEUE", "4"))
 _semaphore: asyncio.Semaphore | None = None
 _active_count = 0
 _queue_depth  = 0
+_active_requests = {}
 
 def _get_semaphore() -> asyncio.Semaphore:
     global _semaphore
@@ -24,7 +27,7 @@ def _get_semaphore() -> asyncio.Semaphore:
         _semaphore = asyncio.Semaphore(OLLAMA_CONCURRENCY)
     return _semaphore
 
-async def _acquire_slot() -> None:
+async def _acquire_slot() -> int:
     """Acquire a queue slot, raising 429 if the wait queue is full."""
     global _active_count, _queue_depth
     sem = _get_semaphore()
@@ -41,10 +44,16 @@ async def _acquire_slot() -> None:
                 },
             },
         )
+    queued_at = time.perf_counter()
     _queue_depth += 1
-    await sem.acquire()
+    try:
+        await sem.acquire()
+    except Exception:
+        _queue_depth -= 1
+        raise
     _queue_depth -= 1
     _active_count += 1
+    return int((time.perf_counter() - queued_at) * 1000)
 
 def _release_slot() -> None:
     global _active_count
@@ -53,9 +62,9 @@ def _release_slot() -> None:
 
 @asynccontextmanager
 async def ollama_queue_slot():
-    await _acquire_slot()
+    wait_ms = await _acquire_slot()
     try:
-        yield
+        yield wait_ms
     finally:
         _release_slot()
 
@@ -86,6 +95,11 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             model TEXT NOT NULL,
             endpoint TEXT NOT NULL,
+            app_name TEXT NOT NULL DEFAULT 'Gateway',
+            status_code INTEGER,
+            duration_ms INTEGER,
+            wait_ms INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS projects (
@@ -103,25 +117,118 @@ def init_db():
             FOREIGN KEY (project_id) REFERENCES projects(id)
         );
     """)
-    # Add notes column if upgrading from old schema
-    try:
-        conn.execute("ALTER TABLE projects ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
-        conn.commit()
-    except Exception:
-        pass
+    migrations = [
+        "ALTER TABLE projects ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE request_log ADD COLUMN app_name TEXT NOT NULL DEFAULT 'Gateway'",
+        "ALTER TABLE request_log ADD COLUMN status_code INTEGER",
+        "ALTER TABLE request_log ADD COLUMN duration_ms INTEGER",
+        "ALTER TABLE request_log ADD COLUMN wait_ms INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE request_log ADD COLUMN error TEXT",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
 init_db()
 
-def log_request(model: str, endpoint: str, app_name: str = "Gateway"):
+def log_request(
+    model: str,
+    endpoint: str,
+    app_name: str = "Gateway",
+    status_code: int | None = None,
+    duration_ms: int | None = None,
+    wait_ms: int = 0,
+    error: str | None = None,
+):
     conn = get_db()
     conn.execute(
-        "INSERT INTO request_log (model, endpoint, app_name, created_at) VALUES (?, ?, ?, ?)",
-        (model, endpoint, app_name, datetime.now().isoformat())
+        """
+        INSERT INTO request_log
+            (model, endpoint, app_name, status_code, duration_ms, wait_ms, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            model,
+            endpoint,
+            app_name,
+            status_code,
+            duration_ms,
+            wait_ms,
+            error,
+            datetime.now().isoformat(timespec="seconds"),
+        )
     )
     conn.commit()
     conn.close()
+
+def queue_snapshot():
+    return {
+        "active": _active_count,
+        "waiting": _queue_depth,
+        "concurrency_limit": OLLAMA_CONCURRENCY,
+        "queue_limit": OLLAMA_MAX_QUEUE,
+        "available_slots": max(OLLAMA_CONCURRENCY - _active_count, 0),
+        "is_full": _queue_depth >= OLLAMA_MAX_QUEUE,
+    }
+
+def begin_active_request(endpoint: str, body: dict, app_name: str, wait_ms: int) -> str:
+    request_id = uuid.uuid4().hex[:10]
+    _active_requests[request_id] = {
+        "id": request_id,
+        "endpoint": endpoint,
+        "model": body.get("model", "unknown"),
+        "app_name": app_name,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "wait_ms": wait_ms,
+        "stream": bool(body.get("stream", True)),
+    }
+    return request_id
+
+def finish_active_request(request_id: str):
+    _active_requests.pop(request_id, None)
+
+def active_requests_snapshot():
+    now = time.time()
+    result = []
+    for req in _active_requests.values():
+        started = datetime.fromisoformat(req["started_at"]).timestamp()
+        result.append({**req, "elapsed_ms": int((now - started) * 1000)})
+    return sorted(result, key=lambda r: r["started_at"])
+
+def recent_request_stats(limit: int = 25):
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT model, endpoint, app_name, status_code, duration_ms, wait_ms, error, created_at
+        FROM request_log
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) as c FROM request_log").fetchone()["c"]
+    conn.close()
+    recent = [dict(r) for r in rows]
+    completed = [r for r in recent if r.get("duration_ms") is not None]
+    failures = [r for r in recent if r.get("status_code") and r["status_code"] >= 400]
+    avg_duration = None
+    avg_wait = None
+    if completed:
+        avg_duration = round(sum(r["duration_ms"] for r in completed) / len(completed))
+        avg_wait = round(sum(r.get("wait_ms") or 0 for r in completed) / len(completed))
+    return {
+        "total_requests": total,
+        "recent": recent,
+        "recent_count": len(recent),
+        "recent_failures": len(failures),
+        "avg_duration_ms": avg_duration,
+        "avg_wait_ms": avg_wait,
+    }
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
@@ -136,12 +243,32 @@ async def health():
     return {
         "gateway": "ok",
         "ollama": "ok" if ollama_ok else "unreachable",
-        "queue": {
-            "active": _active_count,
-            "waiting": _queue_depth,
-            "concurrency_limit": OLLAMA_CONCURRENCY,
-            "queue_limit": OLLAMA_MAX_QUEUE,
-        },
+        "queue": queue_snapshot(),
+    }
+
+@app.get("/api/gateway/status")
+async def gateway_status():
+    ollama_ok = False
+    active_model = None
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(OLLAMA_HOST)
+            ollama_ok = r.status_code == 200
+            ps = await client.get(f"{OLLAMA_HOST}/api/ps")
+            active_models = ps.json().get("models", [])
+            if active_models:
+                active_model = active_models[0].get("name")
+    except Exception:
+        pass
+
+    return {
+        "gateway": "ok",
+        "ollama": "ok" if ollama_ok else "unreachable",
+        "active_model": active_model,
+        "queue": queue_snapshot(),
+        "active_requests": active_requests_snapshot(),
+        "requests": recent_request_stats(),
+        "refreshed_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 # ── Node stats (active model + CPU/RAM only when model running) ───────────────
@@ -191,22 +318,46 @@ async def models():
 async def generate(request: Request):
     body = await request.json()
     app_name = request.headers.get("X-App-Name", "Gateway")
-    log_request(body.get("model", "unknown"), "generate", app_name)
+    model = body.get("model", "unknown")
     if body.get("stream", True):
-        await _acquire_slot()
+        wait_ms = await _acquire_slot()
+        request_id = begin_active_request("generate", body, app_name, wait_ms)
+        started = time.perf_counter()
+        status_code = 200
+        error = None
         async def streamer():
+            nonlocal status_code, error
             try:
                 async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                     async with client.stream("POST", f"{OLLAMA_HOST}/api/generate", json=body) as r:
+                        status_code = r.status_code
                         async for chunk in r.aiter_bytes():
                             yield chunk
+            except Exception as e:
+                status_code = 502
+                error = str(e)
+                raise
             finally:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                log_request(model, "generate", app_name, status_code, duration_ms, wait_ms, error)
+                finish_active_request(request_id)
                 _release_slot()
         return StreamingResponse(streamer(), media_type="application/x-ndjson")
-    async with ollama_queue_slot():
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.post(f"{OLLAMA_HOST}/api/generate", json=body)
-            return JSONResponse(content=r.json())
+    async with ollama_queue_slot() as wait_ms:
+        request_id = begin_active_request("generate", body, app_name, wait_ms)
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                r = await client.post(f"{OLLAMA_HOST}/api/generate", json=body)
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                log_request(model, "generate", app_name, r.status_code, duration_ms, wait_ms)
+                return JSONResponse(content=r.json(), status_code=r.status_code)
+        except Exception as e:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            log_request(model, "generate", app_name, 502, duration_ms, wait_ms, str(e))
+            raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            finish_active_request(request_id)
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
@@ -214,35 +365,78 @@ async def generate(request: Request):
 async def chat(request: Request):
     body = await request.json()
     app_name = request.headers.get("X-App-Name", "Gateway")
-    log_request(body.get("model", "unknown"), "chat", app_name)
+    model = body.get("model", "unknown")
     if body.get("stream", True):
-        await _acquire_slot()
+        wait_ms = await _acquire_slot()
+        request_id = begin_active_request("chat", body, app_name, wait_ms)
+        started = time.perf_counter()
+        status_code = 200
+        error = None
         async def streamer():
+            nonlocal status_code, error
             try:
                 async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                     async with client.stream("POST", f"{OLLAMA_HOST}/api/chat", json=body) as r:
+                        status_code = r.status_code
                         async for chunk in r.aiter_bytes():
                             yield chunk
+            except Exception as e:
+                status_code = 502
+                error = str(e)
+                raise
             finally:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                log_request(model, "chat", app_name, status_code, duration_ms, wait_ms, error)
+                finish_active_request(request_id)
                 _release_slot()
         return StreamingResponse(streamer(), media_type="application/x-ndjson")
-    async with ollama_queue_slot():
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.post(f"{OLLAMA_HOST}/api/chat", json=body)
-            return JSONResponse(content=r.json())
+    async with ollama_queue_slot() as wait_ms:
+        request_id = begin_active_request("chat", body, app_name, wait_ms)
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                r = await client.post(f"{OLLAMA_HOST}/api/chat", json=body)
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                log_request(model, "chat", app_name, r.status_code, duration_ms, wait_ms)
+                return JSONResponse(content=r.json(), status_code=r.status_code)
+        except Exception as e:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            log_request(model, "chat", app_name, 502, duration_ms, wait_ms, str(e))
+            raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            finish_active_request(request_id)
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/usage")
 async def usage():
     conn = get_db()
-    rows = conn.execute("""
-        SELECT model, COUNT(*) as total_requests, MAX(created_at) as last_used
+    by_model = conn.execute("""
+        SELECT
+            model,
+            COUNT(*) as total_requests,
+            MAX(created_at) as last_used,
+            ROUND(AVG(duration_ms)) as avg_duration_ms,
+            ROUND(AVG(wait_ms)) as avg_wait_ms,
+            SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as failures
         FROM request_log GROUP BY model ORDER BY total_requests DESC
+    """).fetchall()
+    by_app = conn.execute("""
+        SELECT
+            app_name,
+            COUNT(*) as total_requests,
+            MAX(created_at) as last_used,
+            ROUND(AVG(duration_ms)) as avg_duration_ms,
+            SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as failures
+        FROM request_log GROUP BY app_name ORDER BY total_requests DESC
     """).fetchall()
     total = conn.execute("SELECT COUNT(*) as c FROM request_log").fetchone()["c"]
     conn.close()
-    return {"total_requests": total, "by_model": [dict(r) for r in rows]}
+    return {
+        "total_requests": total,
+        "by_model": [dict(r) for r in by_model],
+        "by_app": [dict(r) for r in by_app],
+    }
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 
@@ -584,9 +778,9 @@ Python packages:
 async def activity():
     conn = get_db()
     rows = conn.execute("""
-        SELECT model, endpoint, app_name, created_at
+        SELECT model, endpoint, app_name, status_code, duration_ms, wait_ms, error, created_at
         FROM request_log
-        ORDER BY created_at DESC
+        ORDER BY id DESC
         LIMIT 25
     """).fetchall()
     conn.close()
@@ -600,7 +794,7 @@ async def topology():
     rows = conn.execute("""
         SELECT app_name, model, MAX(created_at) as last_seen
         FROM request_log
-        WHERE created_at >= datetime('now', '-5 minutes')
+        WHERE datetime(replace(created_at, 'T', ' ')) >= datetime('now', '-5 minutes')
         GROUP BY app_name, model
         ORDER BY last_seen DESC
     """).fetchall()
